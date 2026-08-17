@@ -93,78 +93,12 @@ Per-tab routing would need a browser extension using `chrome.tabCapture` and
 
 ## Troubleshooting
 
-### Only one sink shows up
+Audio problems on Linux are usually below this script: a sink that exists but
+stays silent, a card profile that only exposes one output, a digital switch
+muted where `pactl` cannot see it.
 
-Common on Intel laptops. Check your card profiles:
-
-```bash
-pactl list cards | grep -A40 "Profiles:"
-```
-
-If every profile says `sinks: 1`, no profile exposes analog and HDMI at the
-same time. Switching profiles would swap outputs, not add one. Confirm the
-HDMI hardware exists:
-
-```bash
-aplay -l | grep -i hdmi
-```
-
-A line like `card 0: PCH, device 3: HDMI 0 [HG556J02]` means the monitor's
-EDID name was read, so it's connected and advertises audio. That's `hw:0,3`.
-
-Copy `examples/10-hdmi-sink.conf` to
-`~/.config/pipewire/pipewire.conf.d/`, edit `api.alsa.path` to match, then:
-
-```bash
-systemctl --user restart pipewire pipewire-pulse wireplumber
-```
-
-This works because the active card profile doesn't claim that PCM, so the
-static node grabs it without fighting WirePlumber.
-
-The `pro-audio` profile is an alternative one-liner that exposes every PCM at
-once, but it bypasses the ACP layer, so headphone jack detection stops working.
-
-### Sink exists but no sound
-
-1. Run `alsamixer -c 0`: press F6, select the card, unmute any `S/PDIF` / `IEC958`
-   channel with `M`
-2. Add `audio.rate = 48000` to the drop-in; some HDMI PCMs reject the default
-3. Check the monitor's own OSD volume and input source
-4. `paplay -d SINKNAME /usr/share/sounds/alsa/Front_Center.wav` to test directly
-
-`speaker-test -D hw:0,3` returning `-16 Device or resource busy` is expected since
-PipeWire holds the device. That test only works with PipeWire stopped.
-
-### Autostart without systemd
-
-Some MATE and XFCE sessions don't reliably reach `graphical-session.target`,
-so the user unit never fires. Use the desktop's own autostart instead:
-
-```bash
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/audio-follows-window.desktop << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Audio Follows Window
-Exec=%h/.local/bin/audio-follows-window --watch
-X-GNOME-Autostart-enabled=true
-EOF
-```
-
-MATE users can also add it through **Startup Applications** in the menu.
-
-### Nothing happens when I drag
-
-Run with `-v`. No output at all usually means `xdotool` isn't returning a
-window. Check `xdotool getactivewindow getwindowgeometry`. If that fails,
-you're on Wayland.
-
-### Wayland
-
-Not supported. Each compositor needs its own
-approach: `swaymsg -t get_tree` on wlroots, a KWin script on KDE, a shell
-extension on GNOME. Contributions welcome.
+See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** for a step-by-step diagnostic
+ladder and fixes for each layer.
 
 ## License
 
