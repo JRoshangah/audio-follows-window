@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+audio-follows-window: Automatically move the focused app's audio to the display it's on.
+
+Watches the active X11 window. When you drag it to a different
+monitor, streams belonging to that app move to the audio sink mapped to that
+monitor.
+
+    audio-follows-window --setup     # writes the config
+    audio-follows-window --watch     # run it
+    audio-follows-window --list      # show detected monitors and sinks
+    audio-follows-window --once      # route the focused window
+
+Default config: ~/.config/audio-follows-window/config.ini
+
+Dependencies: 
+    xdotool
+    xprop (x11-utils)
+    pactl (PulseAudio 16+ or pipewire-pulse).
+    
+Available for X11 only.
+"""
+
+import argparse
+import configparser
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+APP_NAME = "audio-follows-window"
+GEOM_RE = re.compile(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)")
+
+DEFAULT_POLL_SECONDS = 0.3
+PRUNE_EVERY_TICKS = 100
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_NAME, "config.ini")
+
+
+def load_config():
+    """Returns (monitor_sinks dict, poll_seconds float)."""
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # keep output names case-sensitive: eDP-1, HDMI-1
+    read = parser.read(config_path())
+
+    mapping = dict(parser["monitors"]) if read and parser.has_section("monitors") else {}
+    poll = DEFAULT_POLL_SECONDS
+    if read and parser.has_section("settings"):
+        try:
+            poll = float(parser["settings"].get("poll_seconds", DEFAULT_POLL_SECONDS))
+        except ValueError:
+            pass
+    return mapping, poll
+
+
+def run(cmd):
+    """Run a command, returning stdout or None on failure."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+# X11
+
+def get_monitors():
+    """[(name, x, y, w, h), ...] in the global screen coordinate space."""
+    out = run(["xrandr", "--listmonitors"])
+    if not out:
+        return []
+    monitors = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        m = GEOM_RE.search(parts[2])
+        if not m:
+            continue
+        w, h, x, y = (int(g) for g in m.groups())
+        monitors.append((parts[-1], x, y, w, h))
+    return monitors
+
+
+def get_active_window():
+    """(wid, pid, x, y, w, h) for the focused window, or None."""
+    out = run(["xdotool", "getactivewindow", "getwindowgeometry", "--shell"])
+    if not out:
+        return None
+    vals = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            vals[k] = v
+    try:
+        wid = int(vals["WINDOW"])
+        geom = (int(vals["X"]), int(vals["Y"]),
+                int(vals["WIDTH"]), int(vals["HEIGHT"]))
+    except (KeyError, ValueError):
+        return None
+
+    pid_out = run(["xdotool", "getwindowpid", str(wid)])
+    if not pid_out:
+        return None
+    try:
+        pid = int(pid_out.strip())
+    except ValueError:
+        return None
+    return (wid, pid) + geom
+
+
+def live_windows():
+    """Set of window ids that still exist, or None if the query failed."""
+    out = run(["xprop", "-root", "_NET_CLIENT_LIST"])
+    if not out:
+        return None
+    return {int(h, 16) for h in re.findall(r"0x[0-9a-fA-F]+", out)}
+
+
+def monitor_for(rect, monitors):
+    """Output name whose area overlaps the window rect the most."""
+    x, y, w, h = rect
+    best, best_area = None, 0
+    for name, mx, my, mw, mh in monitors:
+        ox = max(0, min(x + w, mx + mw) - max(x, mx))
+        oy = max(0, min(y + h, my + mh) - max(y, my))
+        area = ox * oy
+        if area > best_area:
+            best, best_area = name, area
+    return best
+
+
+# process 
+
+def build_child_map():
+    """ppid -> [child pids], read straight from /proc."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                data = f.read()
+        except OSError:
+            continue
+        try:
+            fields = data[data.rindex(")") + 2:].split()
+            ppid = int(fields[1])
+        except (ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    return children
+
+
+def process_tree(pid):
+    """{pid} plus every descendant. Catches browser audio/content children."""
+    children = build_child_map()
+    seen, stack = {pid}, [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    return seen
+
+
+# audio 
+
+def pactl_json(what):
+    out = run(["pactl", "-f", "json", "list", what])
+    if not out:
+        return []
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+
+def get_sinks():
+    """index -> name."""
+    return {s["index"]: s["name"] for s in pactl_json("sinks")}
+
+
+def get_sink_inputs():
+    """[(stream index, owning pid, current sink index, app label), ...]"""
+    streams = []
+    for si in pactl_json("sink-inputs"):
+        props = si.get("properties", {}) or {}
+        try:
+            pid = int(props.get("application.process.id", ""))
+        except ValueError:
+            continue
+        label = props.get("application.name") or props.get(
+            "application.process.binary") or "?"
+        streams.append((si["index"], pid, si.get("sink"), label))
+    return streams
+
+
+def guess_sink(output_name, sinks):
+    """Fallback when a monitor isn't in the config: match on name hints."""
+    lowered = output_name.lower()
+    for hint in ("hdmi", "displayport", "dp", "usb"):
+        if lowered.startswith(hint):
+            for name in sinks.values():
+                if hint in name.lower():
+                    return name
+    for name in sinks.values():
+        low = name.lower()
+        if "analog" in low or "speaker" in low:
+            return name
+    return None
+
+
+def sink_for_monitor(output_name, sinks, mapping):
+    if output_name in mapping:
+        return mapping[output_name]
+    return guess_sink(output_name, sinks)
+
+
+def apply_routing(pid, output, mapping, verbose=False):
+    """Put every stream owned by pid's process tree on output's sink."""
+    sinks = get_sinks()
+    target = sink_for_monitor(output, sinks, mapping)
+    if not target:
+        if verbose:
+            print(f"no sink mapped for {output}", file=sys.stderr)
+        return
+    target_idx = next((i for i, n in sinks.items() if n == target), None)
+
+    tree = process_tree(pid)
+    for index, spid, cur_sink, label in get_sink_inputs():
+        if spid not in tree or cur_sink == target_idx:
+            continue
+        subprocess.run(["pactl", "move-sink-input", str(index), target],
+                       capture_output=True)
+        if verbose:
+            print(f"{label} -> {output} ({target})")
+
+
+def reroute_active(mapping, verbose=False):
+    """One-shot: route whatever is focused right now."""
+    win = get_active_window()
+    if not win:
+        return
+    _, pid, x, y, w, h = win
+    output = monitor_for((x, y, w, h), get_monitors())
+    if output:
+        apply_routing(pid, output, mapping, verbose)
+
+
+# main 
+
+def watch(mapping, poll_seconds, verbose=False):
+    monitors = get_monitors()
+    assignments = {}
+    prev = None
+    ticks = 0
+
+    while True:
+        time.sleep(poll_seconds)
+
+        ticks += 1
+        if ticks % PRUNE_EVERY_TICKS == 0:
+            monitors = get_monitors()
+            live = live_windows()
+            if live is not None:
+                assignments = {w: o for w, o in assignments.items() if w in live}
+
+        win = get_active_window()
+        if not win:
+            prev = None
+            continue
+
+        wid, pid, x, y, w, h = win
+        geom = (x, y, w, h)
+
+        
+        if prev != (wid, geom):
+            prev = (wid, geom)
+            continue
+
+        output = monitor_for(geom, monitors)
+        if output is None:
+            monitors = get_monitors()
+            continue
+
+        previous = assignments.get(wid)
+        assignments[wid] = output
+
+        if previous is None or previous == output:
+            continue
+
+        apply_routing(pid, output, mapping, verbose)
+
+
+def do_list():
+    print("Monitors (xrandr output names):")
+    for name, x, y, w, h in get_monitors():
+        print(f"  {name:<12} {w}x{h}+{x}+{y}")
+    print("\nSinks (pactl sink names):")
+    for sink in pactl_json("sinks"):
+        print(f"  {sink['name']}")
+        print(f"      {sink.get('description', '')}")
+    print(f"\nConfig: {config_path()}")
+
+
+def do_setup():
+    monitors = get_monitors()
+    sinks = [(s["name"], s.get("description", "")) for s in pactl_json("sinks")]
+
+    if not monitors:
+        sys.exit("No monitors detected. Is xrandr working, and are you on X11?")
+    if len(sinks) < 2:
+        print("Only one audio sink exists.")
+        print("See the README section: 'Only one sink shows up'.\n")
+
+    print("Pick the audio output for each display.\n")
+    mapping = {}
+    for name, x, y, w, h in monitors:
+        print(f"{name}  ({w}x{h} at {x},{y})")
+        for i, (sink_name, desc) in enumerate(sinks, 1):
+            print(f"  {i}) {desc or sink_name}")
+            print(f"     {sink_name}")
+        print("  s) skip this display")
+        while True:
+            choice = input("  choice: ").strip().lower()
+            if choice == "s":
+                break
+            if choice.isdigit() and 1 <= int(choice) <= len(sinks):
+                mapping[name] = sinks[int(choice) - 1][0]
+                break
+            print("  not a valid choice")
+        print()
+
+    parser = configparser.ConfigParser()
+    parser.optionxform = str
+    parser["monitors"] = mapping
+    parser["settings"] = {"poll_seconds": str(DEFAULT_POLL_SECONDS)}
+
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        parser.write(f)
+
+    print(f"Wrote {path}")
+    for out, sink in mapping.items():
+        print(f"  {out} -> {sink}")
+    print("\nNow run:  audio-follows-window --watch -v")
+
+
+def check_deps():
+    missing = [tool for tool in ("xdotool", "xprop", "xrandr", "pactl")
+               if run(["which", tool]) is None]
+    if missing:
+        sys.exit("Missing: " + ", ".join(missing) +
+                 "\nInstall with: sudo apt install xdotool x11-utils x11-xserver-utils")
+    if not run(["pactl", "-f", "json", "list", "sinks"]):
+        sys.exit("pactl JSON output unavailable. Need PulseAudio 16+ or pipewire-pulse.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--setup", action="store_true",
+                      help="interactively map displays to sinks, then exit")
+    mode.add_argument("--list", action="store_true",
+                      help="print monitor outputs and audio sinks, then exit")
+    mode.add_argument("--once", action="store_true",
+                      help="route the focused window once, then exit")
+    mode.add_argument("--watch", action="store_true",
+                      help="run continuously (default)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    check_deps()
+
+    if args.list:
+        do_list()
+        return
+    if args.setup:
+        do_setup()
+        return
+
+    mapping, poll_seconds = load_config()
+    if not mapping:
+        print(f"No config at {config_path()}: falling back to guessing.",
+              file=sys.stderr)
+        print("Run --setup for reliable routing.\n", file=sys.stderr)
+
+    if args.once:
+        reroute_active(mapping, verbose=True)
+        return
+
+    try:
+        watch(mapping, poll_seconds, args.verbose)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

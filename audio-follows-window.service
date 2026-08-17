@@ -1,0 +1,13 @@
+[Unit]
+Description=Move app audio to the display its window is on
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/audio-follows-window --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
