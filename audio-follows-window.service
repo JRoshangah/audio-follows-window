@@ -5,6 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/amixer -c 0 sset IEC958,0 on
 ExecStart=%h/.local/bin/audio-follows-window --watch
 Restart=on-failure
 RestartSec=5
